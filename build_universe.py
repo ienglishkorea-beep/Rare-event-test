@@ -21,6 +21,8 @@ import requests
 1) 넓은 미국 상장 주식 유니버스 확보
 2) ETF / ETN / SPAC / ADR / 바이오 / 특수증권 제거
 3) 최소 실행 가능성 필터 적용
+4) 실제 응답 기준으로 거래소 분포를 함께 출력해서
+   "미국 전체 유니버스인지 / Nasdaq 편중인지" 바로 확인
 """
 
 
@@ -55,11 +57,15 @@ HTTP_HEADERS = {
 # ============================================================
 # 제외 키워드
 # ============================================================
+# 네 기준:
+# - REIT 제거 허용
+# - 바이오 제거 강하게
+# - 특수증권 / ETF / SPAC 제거
+# - BRK.B 같은 특수 ticker 제거 허용
 EXCLUDE_NAME_KEYWORDS: Set[str] = {
     "etf",
     "etn",
     "fund",
-    "trust",
     "spdr",
     "ishares",
     "vanguard",
@@ -82,6 +88,9 @@ EXCLUDE_NAME_KEYWORDS: Set[str] = {
     "royalty trust",
     "note",
     "bond",
+    "reit",
+    "realty",
+    "properties",
 }
 
 EXCLUDE_SECTOR_KEYWORDS: Set[str] = {
@@ -267,6 +276,67 @@ def finalize(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
+# 진단 출력
+# ============================================================
+def print_exchange_distribution(df: pd.DataFrame, title: str) -> None:
+    print(f"\n[{title}] 거래소 분포")
+    if df.empty:
+        print("비어 있음")
+        return
+
+    counts = df["exchange"].fillna("").replace("", "UNKNOWN").value_counts(dropna=False)
+    total = int(len(df))
+
+    for exchange, count in counts.items():
+        pct = (count / total) * 100 if total else 0
+        print(f"- {exchange}: {count:,} ({pct:.1f}%)")
+
+
+def print_exchange_marketcap_median(df: pd.DataFrame, title: str) -> None:
+    print(f"\n[{title}] 거래소별 시총 중앙값")
+    if df.empty:
+        print("비어 있음")
+        return
+
+    temp = df.copy()
+    temp["exchange"] = temp["exchange"].fillna("").replace("", "UNKNOWN")
+
+    grouped = (
+        temp.groupby("exchange", dropna=False)["market_cap"]
+        .median()
+        .sort_values(ascending=False)
+    )
+
+    for exchange, value in grouped.items():
+        if pd.isna(value):
+            print(f"- {exchange}: N/A")
+        else:
+            print(f"- {exchange}: ${value:,.0f}")
+
+
+def print_exchange_dollar_volume_median(df: pd.DataFrame, title: str) -> None:
+    print(f"\n[{title}] 거래소별 거래대금 중앙값")
+    if df.empty:
+        print("비어 있음")
+        return
+
+    temp = df.copy()
+    temp["exchange"] = temp["exchange"].fillna("").replace("", "UNKNOWN")
+
+    grouped = (
+        temp.groupby("exchange", dropna=False)["dollar_volume"]
+        .median()
+        .sort_values(ascending=False)
+    )
+
+    for exchange, value in grouped.items():
+        if pd.isna(value):
+            print(f"- {exchange}: N/A")
+        else:
+            print(f"- {exchange}: ${value:,.0f}")
+
+
+# ============================================================
 # 메인
 # ============================================================
 def main() -> None:
@@ -275,16 +345,19 @@ def main() -> None:
     print("1) Nasdaq Screener 다운로드 중...")
     raw_df = fetch_nasdaq_screener()
     print(f"   원시 rows: {len(raw_df):,}")
+    print_exchange_distribution(raw_df, "원시 데이터")
 
-    print("2) 미국 보통주 근사 유니버스 정제 중...")
+    print("\n2) 미국 보통주 근사 유니버스 정제 중...")
     filtered = filter_us_common_stocks(raw_df)
     print(f"   특수증권 / 외국주 / 바이오 제거 후: {len(filtered):,}")
+    print_exchange_distribution(filtered, "정제 후")
 
-    print("3) 최소 실행 필터 적용 중...")
+    print("\n3) 최소 실행 필터 적용 중...")
     filtered = apply_minimum_execution_filters(filtered)
     print(f"   실행 필터 후: {len(filtered):,}")
+    print_exchange_distribution(filtered, "실행 필터 후")
 
-    print("4) 최종 정리 중...")
+    print("\n4) 최종 정리 중...")
     final_df = finalize(filtered)
 
     final_df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
@@ -292,6 +365,10 @@ def main() -> None:
     print("\n완료")
     print(f"최종 유니버스 수: {len(final_df):,}")
     print(f"저장 위치: {OUTPUT_FILE}")
+
+    print_exchange_distribution(final_df, "최종 유니버스")
+    print_exchange_marketcap_median(final_df, "최종 유니버스")
+    print_exchange_dollar_volume_median(final_df, "최종 유니버스")
 
     if len(final_df) > 0:
         print("\n샘플:")

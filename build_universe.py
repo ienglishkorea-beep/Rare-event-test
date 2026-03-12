@@ -1,28 +1,30 @@
 import os
 import re
-from typing import Any, Optional, Set
+from typing import Any, Optional, Set, List
 
 import pandas as pd
 import requests
 
 
 """
-실행용 유니버스 빌더 (Nasdaq Screener 단독 버전)
+실행용 유니버스 빌더 (미국 전체 근사 유니버스 안정판)
 
 목적
-- SEC 의존성 제거
-- GitHub Actions에서 안정적으로 실행되는 유니버스 생성
-- breadth / long box / 10-day tight 스캐너가 공통 사용 가능한 universe.csv 생성
+- GitHub Actions에서 안정적으로 실행
+- breadth / long box / 10-day tight / market regime 공통 사용
+- Nasdaq API 응답 구조가 바뀌어도 최대한 견고하게 처리
+- 거래소(exchange) 파싱 실패 문제 해결
+- 최종적으로 미국 상장 보통주 근사 유니버스 생성
 
 출력
 - data/universe.csv
 
 철학
-1) 넓은 미국 상장 주식 유니버스 확보
+1) 원천은 Nasdaq Screener API 하나로 단순화
 2) ETF / ETN / SPAC / ADR / 바이오 / 특수증권 제거
-3) 최소 실행 가능성 필터 적용
-4) 실제 응답 기준으로 거래소 분포를 함께 출력해서
-   "미국 전체 유니버스인지 / Nasdaq 편중인지" 바로 확인
+3) REIT 제거
+4) 최소 실행 가능성 필터 적용
+5) exchange 컬럼을 최대한 복구해서 NASDAQ / NYSE / AMEX 분포 확인 가능하게 함
 """
 
 
@@ -51,17 +53,13 @@ HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json, text/plain, */*",
     "Referer": "https://www.nasdaq.com/",
+    "Origin": "https://www.nasdaq.com",
 }
 
 
 # ============================================================
 # 제외 키워드
 # ============================================================
-# 네 기준:
-# - REIT 제거 허용
-# - 바이오 제거 강하게
-# - 특수증권 / ETF / SPAC 제거
-# - BRK.B 같은 특수 ticker 제거 허용
 EXCLUDE_NAME_KEYWORDS: Set[str] = {
     "etf",
     "etn",
@@ -150,6 +148,39 @@ def symbol_has_excluded_pattern(symbol: str) -> bool:
     return False
 
 
+def first_existing_value(row: pd.Series, keys: List[str], default: Any = "") -> Any:
+    for key in keys:
+        if key in row.index:
+            value = row[key]
+            if value is not None and not pd.isna(value) and str(value).strip() != "":
+                return value
+    return default
+
+
+def standardize_exchange_name(x: Any) -> str:
+    s = normalize_text(x).upper()
+
+    if s in {"NASDAQ", "NASDAQGS", "NASDAQGM", "NASDAQCM", "Q", "NMS"}:
+        return "NASDAQ"
+
+    if s in {"NYSE", "N", "NYQ"}:
+        return "NYSE"
+
+    if s in {"AMEX", "NYSEAMERICAN", "NYSE AMERICAN", "A", "ASE"}:
+        return "AMEX"
+
+    if s in {"BATS", "CBOE", "CBOEBZX", "BZX"}:
+        return "BATS"
+
+    if s in {"OTC", "OTCQX", "OTCQB", "PINK", "PNK"}:
+        return "OTC"
+
+    if s == "":
+        return ""
+
+    return s
+
+
 # ============================================================
 # 다운로드
 # ============================================================
@@ -164,48 +195,134 @@ def fetch_nasdaq_screener() -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
 
-    rename_map = {
-        "symbol": "ticker",
-        "name": "name",
-        "lastsale": "price",
-        "marketCap": "market_cap",
-        "volume": "volume",
-        "country": "country",
-        "sector": "sector",
-        "industry": "industry",
-        "exchange": "exchange",
-        "ipoyear": "ipo_year",
-    }
-    df = df.rename(columns=rename_map)
+    # 응답 구조가 바뀌어도 최대한 견고하게 필드 복구
+    if "ticker" not in df.columns:
+        df["ticker"] = df.apply(
+            lambda row: first_existing_value(
+                row,
+                ["symbol", "ticker"],
+                "",
+            ),
+            axis=1,
+        )
 
-    for col in ["ticker", "name", "country", "sector", "industry", "exchange"]:
-        if col not in df.columns:
-            df[col] = ""
+    if "name" not in df.columns:
+        df["name"] = df.apply(
+            lambda row: first_existing_value(
+                row,
+                ["name", "securityName"],
+                "",
+            ),
+            axis=1,
+        )
 
     if "price" not in df.columns:
-        df["price"] = None
+        df["price"] = df.apply(
+            lambda row: first_existing_value(
+                row,
+                ["lastsale", "lastSalePrice", "price", "last"],
+                None,
+            ),
+            axis=1,
+        )
+
     if "market_cap" not in df.columns:
-        df["market_cap"] = None
+        df["market_cap"] = df.apply(
+            lambda row: first_existing_value(
+                row,
+                ["marketCap", "marketcap", "market_cap"],
+                None,
+            ),
+            axis=1,
+        )
+
     if "volume" not in df.columns:
-        df["volume"] = None
+        df["volume"] = df.apply(
+            lambda row: first_existing_value(
+                row,
+                ["volume", "shareVolume"],
+                None,
+            ),
+            axis=1,
+        )
+
+    if "country" not in df.columns:
+        df["country"] = df.apply(
+            lambda row: first_existing_value(
+                row,
+                ["country"],
+                "",
+            ),
+            axis=1,
+        )
+
+    if "sector" not in df.columns:
+        df["sector"] = df.apply(
+            lambda row: first_existing_value(
+                row,
+                ["sector"],
+                "",
+            ),
+            axis=1,
+        )
+
+    if "industry" not in df.columns:
+        df["industry"] = df.apply(
+            lambda row: first_existing_value(
+                row,
+                ["industry"],
+                "",
+            ),
+            axis=1,
+        )
+
+    # 핵심 수정: exchange 필드 복구
+    if "exchange" not in df.columns:
+        df["exchange"] = df.apply(
+            lambda row: first_existing_value(
+                row,
+                [
+                    "exchange",
+                    "exchangeShortName",
+                    "exchangeName",
+                    "market",
+                    "marketName",
+                ],
+                "",
+            ),
+            axis=1,
+        )
+
+    if "ipo_year" not in df.columns:
+        df["ipo_year"] = df.apply(
+            lambda row: first_existing_value(
+                row,
+                ["ipoyear", "ipoYear"],
+                "",
+            ),
+            axis=1,
+        )
+
+    # 기본 문자열 정리
+    for col in ["ticker", "name", "country", "sector", "industry", "exchange"]:
+        df[col] = df[col].astype(str).str.strip()
 
     df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
-    df["name"] = df["name"].astype(str).str.strip()
-    df["country"] = df["country"].astype(str).str.strip()
-    df["sector"] = df["sector"].astype(str).str.strip()
-    df["industry"] = df["industry"].astype(str).str.strip()
-    df["exchange"] = df["exchange"].astype(str).str.strip()
 
+    # 숫자 정리
     df["price"] = (
         df["price"]
         .astype(str)
         .str.replace("$", "", regex=False)
         .str.replace(",", "", regex=False)
-        .replace({"N/A": None, "": None})
+        .replace({"N/A": None, "": None, "None": None})
     )
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
     df["market_cap"] = pd.to_numeric(df["market_cap"], errors="coerce")
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+
+    # exchange 표준화
+    df["exchange"] = df["exchange"].apply(standardize_exchange_name)
 
     df["dollar_volume"] = df["price"] * df["volume"]
 
@@ -221,6 +338,11 @@ def filter_us_common_stocks(df: pd.DataFrame) -> pd.DataFrame:
 
     # 미국 외 국가 제거
     out = out[out["country"].isin(["", "United States"])].copy()
+
+    # 미국 주요 거래소만 허용
+    # exchange가 비어 있어도 현재 API 특성상 일부 케이스가 있을 수 있어 일단 유지
+    # 다만 OTC는 명시적 제거
+    out = out[out["exchange"] != "OTC"].copy()
 
     # ticker 특수형 제거
     out = out[~out["ticker"].apply(symbol_has_excluded_pattern)].copy()
@@ -270,6 +392,7 @@ def finalize(df: pd.DataFrame) -> pd.DataFrame:
 
     out["ticker"] = out["ticker"].astype(str).str.upper().str.strip()
     out["name"] = out["name"].astype(str).str.strip()
+    out["exchange"] = out["exchange"].astype(str).str.strip()
 
     out = out.drop_duplicates(subset=["ticker"]).sort_values("ticker").reset_index(drop=True)
     return out
@@ -349,7 +472,7 @@ def main() -> None:
 
     print("\n2) 미국 보통주 근사 유니버스 정제 중...")
     filtered = filter_us_common_stocks(raw_df)
-    print(f"   특수증권 / 외국주 / 바이오 제거 후: {len(filtered):,}")
+    print(f"   특수증권 / 외국주 / 바이오 / REIT 제거 후: {len(filtered):,}")
     print_exchange_distribution(filtered, "정제 후")
 
     print("\n3) 최소 실행 필터 적용 중...")

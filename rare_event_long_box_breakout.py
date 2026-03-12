@@ -52,7 +52,9 @@ PYRAMID_LEVELS = [0.02, 0.04, 0.06]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-MAX_TELEGRAM_ROWS = 15
+
+# 텔레그램 안전 길이 (4096보다 약간 작게)
+TELEGRAM_MAX_CHARS = 3500
 
 
 @dataclass
@@ -394,7 +396,19 @@ def find_best_long_box(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     return best
 
 
-def classify_event(df: pd.DataFrame, box: Dict[str, Any]) -> Tuple[Optional[str], str, Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
+def classify_event(
+    df: pd.DataFrame,
+    box: Dict[str, Any],
+) -> Tuple[
+    Optional[str],
+    str,
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+]:
     row = df.iloc[-1]
     close = float(row["Close"])
     box_high = float(box["box_high"])
@@ -434,7 +448,12 @@ def classify_event(df: pd.DataFrame, box: Dict[str, Any]) -> Tuple[Optional[str]
     return None, "피벗 구간 아님", None, None, None, None, None, vol_ratio
 
 
-def calculate_total_score(box: Dict[str, Any], vol_ratio: Optional[float], state: str, rs_6m_excess: Optional[float]) -> float:
+def calculate_total_score(
+    box: Dict[str, Any],
+    vol_ratio: Optional[float],
+    state: str,
+    rs_6m_excess: Optional[float],
+) -> float:
     s_vol = breakout_volume_score(vol_ratio)
 
     s_rs = 0.2
@@ -530,12 +549,56 @@ def telegram_enabled() -> bool:
 def send_telegram_message(text: str) -> None:
     if not telegram_enabled():
         return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
     try:
         requests.post(url, data=payload, timeout=20)
     except Exception:
         pass
+
+
+def send_telegram_chunked(title: str, lines: List[str], max_chars: int = TELEGRAM_MAX_CHARS) -> None:
+    """
+    텔레그램 4096자 제한 대응.
+    lines 전체를 여러 메시지로 자동 분할 전송.
+    """
+    if not telegram_enabled():
+        return
+
+    if not lines:
+        send_telegram_message(title)
+        return
+
+    chunks: List[str] = []
+    current = title
+
+    for line in lines:
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > max_chars:
+            chunks.append(current)
+            current = f"{title}\n{line}"
+        else:
+            current = candidate
+
+    if current:
+        chunks.append(current)
+
+    total = len(chunks)
+
+    if total <= 1:
+        send_telegram_message(chunks[0])
+        return
+
+    for idx, chunk in enumerate(chunks, start=1):
+        header = f"{title} ({idx}/{total})"
+        body_lines = chunk.split("\n")[1:] if "\n" in chunk else []
+        body = "\n".join(body_lines)
+        send_telegram_message(f"{header}\n{body}")
 
 
 def load_state() -> Dict[str, Dict[str, Any]]:
@@ -553,45 +616,83 @@ def save_state(state: Dict[str, Dict[str, Any]]) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def build_result_lines(r: LongBoxResult) -> List[str]:
+def build_result_lines(r: LongBoxResult, rank: int) -> List[str]:
     return [
-        f"- {r.ticker} {r.name}",
-        f"  등급: {r.grade} ({r.grade_label}) | 점수: {r.total_score}",
-        f"  상태: {r.state}",
-        f"  종가: {format_price(r.close)}",
-        f"  박스 상단: {format_price(r.box_high)}",
-        f"  박스 하단: {format_price(r.box_low)}",
-        f"  박스 길이: {r.box_length}일",
-        f"  박스 폭: {format_pct(r.box_width_pct)}",
-        f"  상단 테스트: {r.touch_count}회",
-        f"  진입가: {format_price(r.entry_price)}",
-        f"  손절가: {format_price(r.stop_price)}",
-        f"  1차 추가: {format_price(r.add_price_1)}",
-        f"  2차 추가: {format_price(r.add_price_2)}",
-        f"  3차 추가: {format_price(r.add_price_3)}",
+        f"{rank}. {r.ticker} {r.name}",
+        f"등급: {r.grade} ({r.grade_label}) | 점수: {r.total_score}",
+        f"상태: {r.state}",
+        f"종가: {format_price(r.close)}",
+        f"박스 상단: {format_price(r.box_high)}",
+        f"박스 하단: {format_price(r.box_low)}",
+        f"박스 길이: {r.box_length}일",
+        f"박스 폭: {format_pct(r.box_width_pct)}",
+        f"상단 테스트: {r.touch_count}회",
+        f"진입가: {format_price(r.entry_price)}",
+        f"손절가: {format_price(r.stop_price)}",
+        f"1차 추가: {format_price(r.add_price_1)}",
+        f"2차 추가: {format_price(r.add_price_2)}",
+        f"3차 추가: {format_price(r.add_price_3)}",
+        "",
     ]
 
 
+def sort_results(results: List[LongBoxResult]) -> List[LongBoxResult]:
+    state_rank = {
+        "돌파": 0,
+        "돌파 임박": 1,
+    }
+    return sorted(
+        results,
+        key=lambda r: (
+            state_rank.get(r.state, 9),
+            -(r.total_score if r.total_score is not None else -1e18),
+            r.ticker,
+        ),
+    )
+
+
 def notify_changes(results: List[LongBoxResult]) -> None:
+    """
+    요구사항 반영:
+    - 알파벳 순 금지
+    - 점수순 출력
+    - 돌파 / 돌파 임박 분리
+    - 종목 수가 많아도 전부 전송
+    - 텔레그램 길이 초과 시 자동 분할
+    """
     if not telegram_enabled():
         return
 
+    sorted_results = sort_results(results)
+
     prev_state = load_state()
     new_state: Dict[str, Dict[str, Any]] = {}
-    new_alerts: List[LongBoxResult] = []
 
-    for r in results:
-        old = prev_state.get(r.ticker, {})
-        if not (str(old.get("state")) == r.state and str(old.get("as_of_date")) == r.as_of_date and str(old.get("grade")) == r.grade):
-            new_alerts.append(r)
-        new_state[r.ticker] = {"state": r.state, "grade": r.grade, "as_of_date": r.as_of_date}
+    for r in sorted_results:
+        new_state[r.ticker] = {
+            "state": r.state,
+            "grade": r.grade,
+            "as_of_date": r.as_of_date,
+            "total_score": r.total_score,
+        }
 
-    if new_alerts:
-        lines = ["[박스 돌파] Long Box Breakout"]
-        for r in new_alerts[:MAX_TELEGRAM_ROWS]:
-            lines.extend(build_result_lines(r))
-        send_telegram_message("\n".join(lines))
+    # 매일 전체 후보를 전송
+    breakout_results = [r for r in sorted_results if r.state == "돌파"]
+    near_results = [r for r in sorted_results if r.state == "돌파 임박"]
 
+    if breakout_results:
+        breakout_lines: List[str] = []
+        for idx, r in enumerate(breakout_results, start=1):
+            breakout_lines.extend(build_result_lines(r, idx))
+        send_telegram_chunked("[박스 돌파] 점수순", breakout_lines)
+
+    if near_results:
+        near_lines: List[str] = []
+        for idx, r in enumerate(near_results, start=1):
+            near_lines.extend(build_result_lines(r, idx))
+        send_telegram_chunked("[박스 돌파 임박] 점수순", near_lines)
+
+    # 상태 저장
     save_state(new_state)
 
 
@@ -607,14 +708,22 @@ def save_outputs(results: List[LongBoxResult]) -> None:
         )
         with open(os.path.join(OUTPUT_DIR, "rare_event_long_box_breakout_summary.json"), "w", encoding="utf-8") as f:
             json.dump(
-                {"run_at": datetime.now().isoformat(), "total": 0, "breakout": 0, "near_breakout": 0, "A": 0, "B": 0, "as_of_date": None},
+                {
+                    "run_at": datetime.now().isoformat(),
+                    "total": 0,
+                    "breakout": 0,
+                    "near_breakout": 0,
+                    "A": 0,
+                    "B": 0,
+                    "as_of_date": None,
+                },
                 f,
                 ensure_ascii=False,
                 indent=2,
             )
         return
 
-    df = pd.DataFrame([asdict(r) for r in results]).sort_values(["total_score", "ticker"], ascending=[False, True])
+    df = pd.DataFrame([asdict(r) for r in sort_results(results)])
     df.to_csv(
         os.path.join(OUTPUT_DIR, "rare_event_long_box_breakout.csv"),
         index=False,
@@ -651,6 +760,8 @@ def main() -> None:
                 results.append(result)
         except Exception as e:
             logging.exception("%s failed: %s", row.ticker, e)
+
+    results = sort_results(results)
 
     save_outputs(results)
     notify_changes(results)

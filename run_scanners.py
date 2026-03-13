@@ -5,29 +5,11 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List
 
+import numpy as np
 import pandas as pd
 import requests
 
 
-# ============================================================
-# Unified Scanner Runner
-# ------------------------------------------------------------
-# 실행 순서
-# 1) Breadth
-# 2) Long Box Breakout
-# 3) 10-Day Tight
-# 4) VCP
-# 5) Confluence Alert
-#
-# 목적
-# - 각 스캐너는 기존처럼 자기 결과를 따로 텔레그램 전송
-# - 마지막에 여러 패턴이 겹친 종목만 따로 CONFLUENCE 전송
-# ============================================================
-
-
-# ------------------------------------------------------------
-# 경로
-# ------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 
@@ -50,9 +32,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 MAX_TELEGRAM_MESSAGE_LEN = 3500
 
 
-# ------------------------------------------------------------
-# 텔레그램
-# ------------------------------------------------------------
 def telegram_enabled() -> bool:
     return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
@@ -60,7 +39,6 @@ def telegram_enabled() -> bool:
 def send_telegram(text: str) -> None:
     if not telegram_enabled():
         return
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     requests.post(
         url,
@@ -96,9 +74,6 @@ def send_telegram_chunked(lines: List[str]) -> None:
         send_telegram(chunk)
 
 
-# ------------------------------------------------------------
-# 공통 유틸
-# ------------------------------------------------------------
 def read_json_file(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
         return {}
@@ -149,13 +124,6 @@ def fmt_pct_from_ratio(x: Any) -> str:
     return f"{v * 100:.1f}%"
 
 
-def fmt_pct_direct(x: Any) -> str:
-    v = safe_float(x)
-    if pd.isna(v):
-        return "-"
-    return f"{v:.1f}%"
-
-
 def run_script(script_path: str) -> str:
     try:
         runpy.run_path(script_path, run_name="__main__")
@@ -164,9 +132,6 @@ def run_script(script_path: str) -> str:
         return f"실패: {type(e).__name__}: {e}"
 
 
-# ------------------------------------------------------------
-# 결과 로드
-# ------------------------------------------------------------
 def load_box_candidates() -> Dict[str, Dict[str, Any]]:
     df = read_csv_file(BOX_RESULTS_FILE)
     if df.empty:
@@ -177,7 +142,6 @@ def load_box_candidates() -> Dict[str, Dict[str, Any]]:
         ticker = safe_str(row.get("ticker")).upper()
         if not ticker or ticker == "-":
             continue
-
         out[ticker] = {
             "pattern": "BOX",
             "ticker": ticker,
@@ -207,7 +171,6 @@ def load_tight_candidates() -> Dict[str, Dict[str, Any]]:
         ticker = safe_str(row.get("ticker")).upper()
         if not ticker or ticker == "-":
             continue
-
         out[ticker] = {
             "pattern": "TIGHT",
             "ticker": ticker,
@@ -235,7 +198,6 @@ def load_vcp_candidates() -> Dict[str, Dict[str, Any]]:
         ticker = safe_str(row.get("ticker")).upper()
         if not ticker or ticker == "-":
             continue
-
         out[ticker] = {
             "pattern": "VCP",
             "ticker": ticker,
@@ -254,9 +216,6 @@ def load_vcp_candidates() -> Dict[str, Dict[str, Any]]:
     return out
 
 
-# ------------------------------------------------------------
-# 합류 신호
-# ------------------------------------------------------------
 def build_confluence_rows(
     box_map: Dict[str, Dict[str, Any]],
     tight_map: Dict[str, Dict[str, Any]],
@@ -295,7 +254,6 @@ def build_confluence_rows(
             merged[ticker][source_name] = item
 
     rows: List[Dict[str, Any]] = []
-
     for ticker, item in merged.items():
         patterns = item["patterns"]
         if len(patterns) < 2:
@@ -339,11 +297,7 @@ def build_confluence_message(rows: List[Dict[str, Any]]) -> List[str]:
     for row in rows:
         lines.append(f"- {row['ticker']} {row['name']}")
         lines.append(f"  패턴 수: {row['pattern_count']} | 패턴: {', '.join(row['patterns'])}")
-        if not pd.isna(row["avg_score"]):
-            lines.append(f"  평균 점수: {row['avg_score']:.1f}/100")
-        else:
-            lines.append("  평균 점수: -")
-
+        lines.append(f"  평균 점수: {row['avg_score']:.1f}/100" if not pd.isna(row["avg_score"]) else "  평균 점수: -")
         lines.append(f"  보수 진입가: {fmt_price(row['entry'])}")
         lines.append(f"  보수 손절가: {fmt_price(row['stop'])}")
 
@@ -372,9 +326,6 @@ def build_confluence_message(rows: List[Dict[str, Any]]) -> List[str]:
     return lines
 
 
-# ------------------------------------------------------------
-# 메인
-# ------------------------------------------------------------
 def main() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -400,20 +351,17 @@ def main() -> None:
     else:
         run_status["VCP"] = "스킵(파일 없음)"
 
-    # 결과 로드
     box_map = load_box_candidates()
     tight_map = load_tight_candidates()
     vcp_map = load_vcp_candidates()
 
     confluence_rows = build_confluence_rows(box_map, tight_map, vcp_map)
 
-    # 합류 신호 전송
     if confluence_rows:
         send_telegram_chunked(build_confluence_message(confluence_rows))
     else:
         send_telegram("[합류 신호] CONFLUENCE\n전체 후보: 0")
 
-    # 실행 엔진 요약
     breadth_summary = read_json_file(BREADTH_SUMMARY_FILE)
     box_summary = read_json_file(BOX_SUMMARY_FILE)
     tight_summary = read_json_file(TIGHT_SUMMARY_FILE)
@@ -467,6 +415,7 @@ def main() -> None:
         lines.append(f"- 총 후보: {safe_str(vcp_summary.get('total', 0))}")
         lines.append(f"- 돌파 임박: {safe_str(vcp_summary.get('near_breakout', 0))}")
         lines.append(f"- 1차 돌파: {safe_str(vcp_summary.get('first_breakout', 0))}")
+        lines.append(f"- 후행 가능: {safe_str(vcp_summary.get('late_breakout', 0))}")
         lines.append(f"- RS S: {safe_str(vcp_summary.get('rs_s', 0))}")
         lines.append(f"- RS A: {safe_str(vcp_summary.get('rs_a', 0))}")
         lines.append(f"- RS B: {safe_str(vcp_summary.get('rs_b', 0))}")
